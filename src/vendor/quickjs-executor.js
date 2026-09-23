@@ -26,6 +26,7 @@
  */
 
 import quickjsWasmModule from './quickjs.wasm';
+import lodashSource from 'virtual:lodash-source';
 import YAML from '@/utils/yaml';
 
 // 使用全局作用域缓存，避免跨请求重复编译 WASM
@@ -94,17 +95,14 @@ async function initQuickJS() {
 
     const QuickJS = await newQuickJSWASMModule(adaptVariant);
     const runtime = QuickJS.newRuntime();
-    runtime.setMemoryLimit(1024 * 512);       // 512KB 内存限制
-    runtime.setMaxStackSize(1024 * 256);      // 256KB 栈限制
-    // 每 5000 条指令中断检查，防止死循环
-    var __interruptCounter = 0;
+    runtime.setMemoryLimit(1024 * 1024 * 64); // 64MB（原先 512KB 会把 lodash 直接 OOM）
+    runtime.setMaxStackSize(1024 * 512);      // 512KB 栈限制
+    // 按墙钟时间限制单次脚本执行，防止死循环。
+    // （原先按指令计数每 5000 次就强制中断，会误伤 lodash 这类重初始化的脚本）
+    globalThis.__quickjsDeadline = 0;
     runtime.setInterruptHandler(function () {
-        __interruptCounter++;
-        if (__interruptCounter >= 5000) {
-            __interruptCounter = 0;
-            return true;
-        }
-        return false;
+        var dl = globalThis.__quickjsDeadline;
+        return !!dl && Date.now() > dl;
     });
 
     const context = runtime.newContext();
@@ -131,12 +129,63 @@ async function newSandboxContext() {
  * @param {object} context - QuickJSContext
  * @param {object} api - 要注入的键值对
  */
+function isPlainData(value, depth) {
+    depth = depth || 0;
+    if (depth > 8) return false;
+    if (value === null) return true;
+    var t = typeof value;
+    if (t === 'string' || t === 'number' || t === 'boolean') return true;
+    if (t !== 'object') return false;
+    if (Array.isArray(value)) {
+        for (var i = 0; i < value.length; i++) {
+            if (!isPlainData(value[i], depth + 1)) return false;
+        }
+        return true;
+    }
+    var proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return false;
+    var ks = Object.keys(value);
+    for (var j = 0; j < ks.length; j++) {
+        if (!isPlainData(value[ks[j]], depth + 1)) return false;
+    }
+    return true;
+}
+
 function injectAPI(context, api) {
+    // lodash 是函数库，JSON 序列化会把方法全丢掉。
+    // 改为把真实 lodash 源码直接注入沙箱求值，保证与宿主行为一致。
+    if (api && api.lodash !== undefined && typeof lodashSource === 'string') {
+        var lodashResult = context.evalCode(
+            'var module = { exports: {} };\nvar exports = module.exports;\n' +
+                lodashSource +
+                '\n; var lodash = (module.exports && module.exports._) ? module.exports._ : this._;',
+        );
+        if (lodashResult.error) {
+            var lErrMsg = getErrorMessage(context, lodashResult.error);
+            lodashResult.error.dispose();
+            throw new Error('Failed to inject lodash: ' + lErrMsg);
+        }
+        if (lodashResult.value) lodashResult.value.dispose();
+    }
+
     var apiKeys = Object.keys(api);
     for (var i = 0; i < apiKeys.length; i++) {
         var key = apiKeys[i];
+        if (key === 'lodash') continue; // 已在上面注入
         var value = api[key];
-        if (value === undefined) continue;
+
+        // 跨不了沙箱边界的值（函数、含方法的对象等）：绑定为 undefined。
+        // 与上游 new Function 形参传 undefined 的行为一致——绑定存在但值为空，
+        // 脚本用 `if (x)` 判断不会抛 ReferenceError。
+        if (value === undefined || !isPlainData(value)) {
+            var undefResult = context.evalCode('var ' + key + ' = undefined;');
+            if (undefResult.error) {
+                undefResult.error.dispose();
+            } else if (undefResult.value) {
+                undefResult.value.dispose();
+            }
+            continue;
+        }
 
         var jsonValue = JSON.stringify(value);
         var setResult = context.evalCode(
@@ -185,6 +234,7 @@ function injectAPI(context, api) {
  */
 async function executeInSandbox(script, name, api) {
     api = api || {};
+    globalThis.__quickjsDeadline = Date.now() + 5000;
     var result = await newSandboxContext();
     var context = result.context;
     var runtime = result.runtime;
@@ -256,6 +306,7 @@ function cleanup() {
  * @returns {*} 宿主环境结果
  */
 async function callSandboxFunction(context, runtime, fnHandle, callArgs) {
+    globalThis.__quickjsDeadline = Date.now() + 5000;
     var callResult = context.callFunction(fnHandle, context.null, callArgs);
 
     // 释放输入参数
@@ -368,7 +419,7 @@ function isMihomoProfile(proxies) {
  * @param {object} $options - 扩展选项
  * @returns {function} async function
  */
-function createScriptFunction(script, name, $arguments, $options) {
+function createScriptFunction(script, name, $arguments, $options, hostGlobals) {
     return async function () {
         var args = arguments;
         var proxies = args[0];       // args[0] = proxies
@@ -379,6 +430,17 @@ function createScriptFunction(script, name, $arguments, $options) {
             $arguments: $arguments || {},
             $options: $options || {},
         };
+
+        // 宿主注入的全局（lodash / ProxyUtils / $substore / flowUtils ...）。
+        // 上游是用 new Function 的形参闭包绑定的，这里由 esbuild 垫片显式传入。
+        if (hostGlobals) {
+            var hostKeys = Object.keys(hostGlobals);
+            for (var _h = 0; _h < hostKeys.length; _h++) {
+                if (api[hostKeys[_h]] === undefined) {
+                    api[hostKeys[_h]] = hostGlobals[hostKeys[_h]];
+                }
+            }
+        }
 
         // 上游调用约定: fn(proxies, targetPlatform, context, ...extraArgs)
         // extraArgs 依次对应: $substore, lodash, ...
