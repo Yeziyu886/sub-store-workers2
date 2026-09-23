@@ -72,7 +72,6 @@ jobs:
           fi
 
       - name: Setup Node
-        if: steps.check.outputs.needed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -163,7 +162,7 @@ jobs:
         working-directory: sub-store-workers
         run: |
           cat > wrangler.toml <<'TOML'
-          name = "sub-store-workers"
+          name = "sub-store"
           main = "dist/worker.js"
           compatibility_date = "2024-09-23"
           compatibility_flags = ["nodejs_compat"]
@@ -197,58 +196,66 @@ jobs:
         if: steps.check.outputs.needed == 'true'
         working-directory: sub-store-workers
         run: |
-          mkdir -p pages-dist
-          cp dist/worker.js pages-dist/_worker.js
-          cp dist/quickjs.wasm pages-dist/quickjs.wasm
+          rm -rf pagesproj/_worker.js pagesproj/quickjs.wasm
+          cp dist/worker.js pagesproj/_worker.js
+          cp dist/quickjs.wasm pagesproj/quickjs.wasm
+          sed "s/__KV_ID__/${{ secrets.KV_NAMESPACE_ID }}/" pagesproj/wrangler.tpl.toml > pagesproj/wrangler.toml
 
       - name: Deploy Pages
         if: steps.check.outputs.needed == 'true'
-        working-directory: sub-store-workers
+        working-directory: sub-store-workers/pagesproj
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          npx wrangler pages deploy pages-dist \
+          ../node_modules/.bin/wrangler pages deploy \
             --project-name "${{ secrets.PAGES_PROJECT_NAME }}" \
             --branch main \
             --commit-message "upstream ${{ steps.upstream.outputs.version }}" \
             --commit-dirty=true
 
-      - name: Set Pages environment variables
-        if: steps.check.outputs.needed == 'true'
+      - name: Check frontend release
+        id: fe
+        run: |
+          LATEST=$(curl -s https://api.github.com/repos/sub-store-org/Sub-Store-Front-End/releases/latest | jq -r '.tag_name // empty')
+          LAST=$(cat sub-store-workers/frontend-version 2>/dev/null || echo "none")
+          echo "frontend: latest=$LATEST last=$LAST"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          if [ -n "$LATEST" ] && [ "$LATEST" != "$LAST" ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy frontend
+        if: steps.fe.outputs.needed == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          PAGES_PROJECT_NAME: ${{ secrets.PAGES_PROJECT_NAME }}
         run: |
-          echo "Setting SCRIPT_ENGINE=quickjs for Pages project: ${PAGES_PROJECT_NAME}"
-          RESP=$(curl -s -X PATCH \
-            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PAGES_PROJECT_NAME}" \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "deployment_configs": {
-                "production": {
-                  "env_vars": {
-                    "SCRIPT_ENGINE": {
-                      "value": "quickjs",
-                      "type": "plain_text"
-                    }
-                  }
-                }
-              }
-            }')
-          SUCCESS=$(echo "$RESP" | jq -r '.success // false')
-          if [ "$SUCCESS" = "true" ]; then
-            echo "Pages environment variables set successfully"
-          else
-            echo "::warning::Failed to set Pages environment variables: $(echo "$RESP" | jq -r '.errors // []')"
-          fi
+          curl -sL -o fe-dist.zip "https://github.com/sub-store-org/Sub-Store-Front-End/releases/download/${{ steps.fe.outputs.latest }}/dist.zip"
+          mkdir -p fe-dist && unzip -q fe-dist.zip -d fe-dist
+          npx --yes wrangler@4 pages deploy fe-dist/dist \
+            --project-name sub-store-ui \
+            --branch main \
+            --commit-message "frontend ${{ steps.fe.outputs.latest }}" \
+            --commit-dirty=true
+
+      - name: Update frontend marker
+        if: steps.fe.outputs.needed == 'true'
+        working-directory: sub-store-workers
+        run: |
+          echo "${{ steps.fe.outputs.latest }}" > frontend-version
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add frontend-version
+          git commit -m "chore: sync frontend to ${{ steps.fe.outputs.latest }} [skip ci]" || exit 0
+          git push
 
       - name: Health check
         if: steps.check.outputs.needed == 'true'
         run: |
-          URL="https://sub-store-workers.${{ secrets.WORKERS_SUBDOMAIN }}.workers.dev"
+          URL="https://subapi.tokfans.cc.cd/"
           for i in 1 2 3; do
             sleep 10
             CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL/")
