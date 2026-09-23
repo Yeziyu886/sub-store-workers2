@@ -55,6 +55,19 @@ const aliasPlugin = {
 const evalRewritePlugin = {
     name: 'eval-rewrite',
     setup(build) {
+        // 把真实 lodash 源码以字符串形式暴露给沙箱注入器（QuickJS 内没有模块系统）
+        build.onResolve({ filter: /^virtual:lodash-source$/ }, () => ({
+            path: 'virtual:lodash-source',
+            namespace: 'lodash-source',
+        }));
+        build.onLoad({ filter: /.*/, namespace: 'lodash-source' }, () => {
+            const lodashFile = fs.realpathSync(require.resolve('lodash/lodash.min.js'));
+            return {
+                contents: `export default ${JSON.stringify(fs.readFileSync(lodashFile, 'utf8'))};`,
+                loader: 'js',
+            };
+        });
+
         build.onLoad({ filter: /\.js$/ }, async (args) => {
             // 仅处理原始源码
             if (!args.path.startsWith(ORIGINAL_SRC)) return null;
@@ -119,7 +132,32 @@ const evalRewritePlugin = {
         throw new Error('Script Operator is disabled. Remove SCRIPT_ENGINE="disabled" from wrangler.toml [vars] to re-enable. Alternative: use built-in filters/operators, mihomo YAML patch, or an external trusted execution service.');
     }
     const { createScriptFunction } = require('@/vendor/quickjs-executor');
-    return createScriptFunction(script, name, $arguments, $options);
+    // 复刻上游 createDynamicFunction 的形参绑定：这些全局原本是
+    // new Function('$arguments','$options','$substore','lodash',...) 的形参，
+    // 由调用处传入实参；改成 QuickJS 沙箱后必须显式传进来，否则脚本里
+    // 会出现 lodash is not defined 这类 ReferenceError。
+    const flowUtils = {
+        getFlowField,
+        getFlowHeaders,
+        parseFlowHeaders,
+        flowTransfer,
+        validCheck,
+        getRmainingDays,
+        normalizeFlowHeader,
+    };
+    return createScriptFunction(script, name, $arguments, $options, {
+        $substore: $,
+        lodash,
+        ProxyUtils,
+        yaml: ProxyUtils && ProxyUtils.yaml,
+        Buffer: ProxyUtils && ProxyUtils.Buffer,
+        b64d: ProxyUtils && ProxyUtils.Base64 && ProxyUtils.Base64.decode,
+        b64e: ProxyUtils && ProxyUtils.Base64 && ProxyUtils.Base64.encode,
+        DOMAIN_RESOLVERS,
+        scriptResourceCache,
+        flowUtils,
+        produceArtifact,
+    });
 }`,
                 );
             }
